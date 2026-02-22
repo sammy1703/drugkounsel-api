@@ -1,0 +1,47 @@
+[
+    {
+        "drugs": [
+            "Aspirin",
+            "Warfarin"
+        ],
+        "severity": "SEVERE",
+        "description": "Increased risk of severe bleeding when taken together. Both medications thin the blood and interfere with cladding.",
+        "advice": "Do not take together. Consult your doctor immediately to adjust doses or switch medications."
+    },
+    {
+        "drugs": [
+            "Metformin",
+            "Contrast dye"
+        ],
+        "severity": "SEVERE",
+        "description": "Risk of lactic acidosis, a serious metabolic complication. Kidney function must be assessed.",
+        "advice": "Stop metformin 48 hours before and after imaging procedures requiring contrast dye."
+    },
+    {
+        "drugs": [
+            "Ibuprofen",
+            "Lisinopril"
+        ],
+        "severity": "MODERATE",
+        "description": "NSAIDs can reduce the blood pressure lowering effect of Lisinopril and increase risk of kidney strain.",
+        "advice": "Monitor blood pressure regularly. Avoid long-term use of ibuprofen without medical supervision."
+    },
+    {
+        "drugs": [
+            "Simvastatin",
+            "Amlodipine"
+        ],
+        "severity": "MILD",
+        "description": "Amlodipine can slightly increase the levels of Simvastatin in your blood, increasing risk of muscle pain.",
+        "advice": "Monitor for unusual muscle pain or weakness. Dose of Simvastatin may need adjustment."
+    },
+    {
+        "drugs": [
+            "Paracetamol",
+            "Alcohol"
+        ],
+        "severity": "MODERATE",
+        "description": "Combining alcohol with paracetamol increases the risk of toxic liver damage.",
+        "advice": "Avoid excessive alcohol consumption while taking paracetamol."
+    }
+]

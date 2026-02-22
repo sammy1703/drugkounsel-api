@@ -51,42 +51,58 @@ load_databases()
 
 def find_medicine(drug_name):
     drug_name = drug_name.lower().strip()
+    normalized_input = re.sub(r'[^a-z0-9]', '', drug_name)
+    
     for med in MEDICINE_DB:
-        # Match generic name
         generic = med.get("generic") or med.get("name") or med.get("medicine")
-        if generic and drug_name == generic.lower():
-            return med
-        # Match brand names
+        if generic:
+            normalized_generic = re.sub(r'[^a-z0-9]', '', generic.lower())
+            if normalized_input == normalized_generic:
+                return med
+        
         brands = med.get("brands", [])
-        if any(drug_name == b.lower() for b in brands):
-            return med
+        for b in brands:
+            normalized_brand = re.sub(r'[^a-z0-9]', '', b.lower())
+            if normalized_input == normalized_brand:
+                return med
     return None
 
 def severity_rank(level):
     order = {"SEVERE": 3, "MODERATE": 2, "MILD": 1}
     return order.get(level.upper(), 0)
 
-def check_interactions(new_drug, existing_drugs):
+def check_interactions(target_drug_name, existing_drugs):
     if not existing_drugs:
         return {
             "TITLE": "Drug–Drug Interaction Check",
             "RISK_LEVEL": "NONE",
-            "MEDICINES_INVOLVED": "No significant interaction detected",
+            "MEDICINES_INVOLVED": "No other medicines listed",
             "MESSAGE": "No clinically significant interaction identified.",
             "PATIENT_ADVICE": "Continue medications as prescribed."
         }
 
-    interactions_found = []
-    new_drug_lower = new_drug.lower()
+    def get_generic(name):
+        med = find_medicine(name)
+        if med:
+            return (med.get("generic") or med.get("name") or name).lower().strip()
+        return name.lower().strip()
+
+    target_generic = get_generic(target_drug_name)
+    existing_generics = [get_generic(d) for d in existing_drugs]
     
-    for existing in existing_drugs:
-        # Resolve existing drug name to generic if it's a brand
-        existing_med = find_medicine(existing)
-        existing_generic = (existing_med.get("generic") or existing_med.get("name") or existing).lower()
-        
+    interactions_found = []
+    
+    for existing_generic in existing_generics:
+        if target_generic == existing_generic:
+            continue
+            
         for inter in INTERACTION_DB:
-            drugs = [d.lower() for d in inter["drugs"]]
-            if new_drug_lower in drugs and existing_generic in drugs:
+            # Normalize drugs in DB entry for comparison
+            db_drugs = [re.sub(r'[^a-z0-9]', '', d.lower()) for d in inter["drugs"]]
+            norm_target = re.sub(r'[^a-z0-9]', '', target_generic)
+            norm_existing = re.sub(r'[^a-z0-9]', '', existing_generic)
+            
+            if norm_target in db_drugs and norm_existing in db_drugs:
                 interactions_found.append(inter)
 
     if not interactions_found:
@@ -98,7 +114,6 @@ def check_interactions(new_drug, existing_drugs):
             "PATIENT_ADVICE": "Continue medications as prescribed."
         }
 
-    # Find highest severity interaction
     highest = max(interactions_found, key=lambda x: severity_rank(x["severity"]))
 
     return {
@@ -248,9 +263,7 @@ def build_structured_counseling(med, lang):
 
 # ---------------- ROUTES ----------------
 
-@app.route("/audio/<filename>")
-def get_audio_file(filename):
-    return send_from_directory("/tmp", filename)
+# Audio serving disabled
 
 @app.route("/api/counseling", methods=["POST"])
 def counseling():

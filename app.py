@@ -1,328 +1,275 @@
-from flask import Flask, request, jsonify, send_from_directory
-from flask_cors import CORS
-import json
 import os
 import re
+import json
+import logging
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 from openai import OpenAI
 from dotenv import load_dotenv, find_dotenv
 
-# Load environment variables
+# ---------------- CONFIGURATION ----------------
 load_dotenv(find_dotenv(), override=True)
 
 app = Flask(__name__)
 CORS(app)
 
-# Initialize OpenAI client
+# Logging configuration for production
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Constants
+MED_DB_PATH = os.path.join(os.path.dirname(__file__), "data/medicines.json")
+INT_DB_PATH = os.path.join(os.path.dirname(__file__), "data/interactions.json")
+GPT_MODEL = "gpt-4o-mini"
+GPT_TEMP = 0.2
+
+# Initialize OpenAI Client
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# ---------------- DATABASES ----------------
+# ---------------- DATABASE ENGINE ----------------
 MEDICINE_DB = []
 INTERACTION_DB = []
-MED_DB_PATH = "data/medicines.json"
-INT_DB_PATH = "data/interactions.json"
 
 def load_databases():
+    """Charge les bases de données JSON au démarrage."""
     global MEDICINE_DB, INTERACTION_DB
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    
-    # Load Medicines
-    med_path = os.path.join(base_dir, MED_DB_PATH)
-    if os.path.exists(med_path):
-        try:
-            with open(med_path, "r", encoding="utf-8") as f:
+    try:
+        if os.path.exists(MED_DB_PATH):
+            with open(MED_DB_PATH, "r", encoding="utf-8") as f:
                 MEDICINE_DB = json.load(f)
-            print(f"Loaded {len(MEDICINE_DB)} medicines successfully")
-        except Exception as e:
-            print(f"❌ Error loading medicines: {e}")
-            
-    # Load Interactions
-    int_path = os.path.join(base_dir, INT_DB_PATH)
-    if os.path.exists(int_path):
-        try:
-            with open(int_path, "r", encoding="utf-8") as f:
+        if os.path.exists(INT_DB_PATH):
+            with open(INT_DB_PATH, "r", encoding="utf-8") as f:
                 INTERACTION_DB = json.load(f)
-            print(f"Loaded {len(INTERACTION_DB)} interactions successfully")
-        except Exception as e:
-            print(f"❌ Error loading interactions: {e}")
+        logger.info(f"DB Loaded: {len(MEDICINE_DB)} meds, {len(INTERACTION_DB)} interactions.")
+    except Exception as e:
+        logger.error(f"Failed to load DB: {e}")
 
 load_databases()
 
-# ---------------- HELPERS ----------------
+# ---------------- CORE ENGINE HELPERS ----------------
 
-def find_medicine(drug_name):
-    drug_name = drug_name.lower().strip()
-    normalized_input = re.sub(r'[^a-z0-9]', '', drug_name)
-    
+def normalize(name):
+    """Normalizes drug names for reliable matching."""
+    if not name: return ""
+    return re.sub(r'[^a-z0-9]', '', name.lower().strip())
+
+def resolve_to_generic(drug_name):
+    """Resolves a brand name to its generic counterpart using the DB."""
+    norm_input = normalize(drug_name)
     for med in MEDICINE_DB:
-        generic = med.get("generic") or med.get("name") or med.get("medicine")
-        if generic:
-            normalized_generic = re.sub(r'[^a-z0-9]', '', generic.lower())
-            if normalized_input == normalized_generic:
-                return med
+        # Check generic name
+        generic = med.get("generic") or med.get("name")
+        if normalize(generic) == norm_input:
+            return generic
         
+        # Check brand names
         brands = med.get("brands", [])
-        for b in brands:
-            normalized_brand = re.sub(r'[^a-z0-9]', '', b.lower())
-            if normalized_input == normalized_brand:
-                return med
-    return None
+        if any(normalize(b) == norm_input for b in brands):
+            return generic or med.get("name")
+            
+    return drug_name  # Return original if not found
 
-def severity_rank(level):
-    order = {"SEVERE": 3, "MODERATE": 2, "MILD": 1}
-    return order.get(level.upper(), 0)
+def severity_to_score(severity):
+    """Ranks severity for finding the most dangerous interaction."""
+    ranks = {"SEVERE": 3, "MODERATE": 2, "MILD": 1}
+    return ranks.get(severity.upper(), 0)
 
-def check_interactions(target_drug_name, existing_drugs):
-    if not existing_drugs:
+# ---------------- INTERACTION ENGINE ----------------
+
+def check_drug_interactions(target_drug, cabinet):
+    """
+    Checks the target drug against all drugs in the patient's cabinet.
+    Implements bidirectional matching and highest severity detection.
+    """
+    if not cabinet:
         return {
-            "TITLE": "Drug–Drug Interaction Check",
-            "RISK_LEVEL": "NONE",
-            "MEDICINES_INVOLVED": "No other medicines listed",
-            "MESSAGE": "No clinically significant interaction identified.",
-            "PATIENT_ADVICE": "Continue medications as prescribed."
+            "status": "safe",
+            "risk_level": "NONE",
+            "message": "No other medicines to check.",
+            "patient_advice": "No interactions found with current list."
         }
 
-    def get_generic(name):
-        med = find_medicine(name)
-        if med:
-            return (med.get("generic") or med.get("name") or name).lower().strip()
-        return name.lower().strip()
+    target_gen = normalize(resolve_to_generic(target_drug))
+    cabinet_gens = [normalize(resolve_to_generic(d)) for d in cabinet]
+    
+    found_interactions = []
 
-    target_generic = get_generic(target_drug_name)
-    existing_generics = [get_generic(d) for d in existing_drugs]
-    
-    interactions_found = []
-    
-    for existing_generic in existing_generics:
-        if target_generic == existing_generic:
+    for other_gen in cabinet_gens:
+        if not other_gen or other_gen == target_gen:
             continue
             
         for inter in INTERACTION_DB:
-            # Normalize drugs in DB entry for comparison
-            db_drugs = [re.sub(r'[^a-z0-9]', '', d.lower()) for d in inter["drugs"]]
-            norm_target = re.sub(r'[^a-z0-9]', '', target_generic)
-            norm_existing = re.sub(r'[^a-z0-9]', '', existing_generic)
-            
-            if norm_target in db_drugs and norm_existing in db_drugs:
-                interactions_found.append(inter)
+            db_drugs = [normalize(d) for d in inter.get("drugs", [])]
+            # Bidirectional check: Is both the target and the other drug in the DB entry?
+            if target_gen in db_drugs and other_gen in db_drugs:
+                found_interactions.append(inter)
 
-    if not interactions_found:
+    if not found_interactions:
         return {
-            "TITLE": "Drug–Drug Interaction Check",
-            "RISK_LEVEL": "NONE",
-            "MEDICINES_INVOLVED": "No significant interaction detected",
-            "MESSAGE": "No clinically significant interaction identified.",
-            "PATIENT_ADVICE": "Continue medications as prescribed."
+            "status": "safe",
+            "risk_level": "NONE",
+            "message": "No clinically significant interactions found in database.",
+            "patient_advice": "Use as directed by your healthcare professional."
         }
 
-    highest = max(interactions_found, key=lambda x: severity_rank(x["severity"]))
+    # Find the most severe interaction
+    highest = max(found_interactions, key=lambda x: severity_to_score(x.get("severity", "MILD")))
 
     return {
-        "TITLE": "Drug–Drug Interaction Check",
-        "RISK_LEVEL": highest["severity"].upper(),
-        "MEDICINES_INVOLVED": ", ".join(highest["drugs"]),
-        "MESSAGE": highest["description"],
-        "PATIENT_ADVICE": highest["advice"]
+        "status": "warning",
+        "risk_level": highest.get("severity", "MODERATE").upper(),
+        "involved": highest.get("drugs", []),
+        "message": highest.get("description", "A potential interaction was detected."),
+        "patient_advice": highest.get("advice", "Consult your doctor or pharmacist.")
     }
 
-def generate_with_gpt(drug_name, language="English", existing_drugs=None):
-    print(f"Medicine {drug_name} not found, generating with RxKounsel AI")
+# ---------------- AI FALLBACK ENGINE ----------------
+
+def generate_ai_counseling(drug_name, language="English", cabinet=None):
+    """Generates clinical-grade counseling using GPT fallback (gpt-4o-mini)."""
     
-    system_prompt = """You are RxKounsel AI, a professional clinical medication counseling system.
+    system_prompt = """You are RxKounsel AI, a clinical pharmacology engine.
+    Generate a JSON object with strictly:
+    - 'drug': Generic name
+    - 'sections': List of {header, content} (headers: WHAT IS THIS MEDICINE FOR, HOW TO TAKE, IMPORTANT WARNINGS, COMMON SIDE EFFECTS, WHEN TO SEEK MEDICAL HELP, GENERAL ADVICE)
+    - 'brands': List of common brands
+    - 'language': The requested language
+    Rules: Minimum 100 words per section. Simple language. Medical accuracy is mandatory."""
 
-STRICT RULES:
-- Always generate detailed patient-friendly counseling.
-- Minimum 120 words per section.
-- Use simple language.
-- No empty sections.
-- Always return valid JSON only.
-- Never return null sections.
+    user_prompt = f"Medicine: {drug_name}\nLanguage: {language}\nCabinet: {cabinet}"
 
-FORMAT:
-{
-  "found": true,
-  "drug": "<drug_name>",
-  "sections": [
-    {
-      "header": "WHAT IS THIS MEDICINE FOR",
-      "content": "<detailed explanation>"
-    },
-    {
-      "header": "HOW TO TAKE",
-      "content": "<clear dosing guidance>"
-    },
-    {
-      "header": "IMPORTANT WARNINGS",
-      "content": "<safety warnings>"
-    },
-    {
-      "header": "COMMON SIDE EFFECTS",
-      "content": "<common effects explained>"
-    },
-    {
-      "header": "WHEN TO SEEK MEDICAL HELP",
-      "content": "<emergency signs>"
-    },
-    {
-      "header": "GENERAL ADVICE",
-      "content": "<storage and general care>"
-    }
-  ],
-  "brands": ["brand1", "brand2"]
-}
-"""
-
-    user_content = f"Drug: {drug_name}\nLanguage: {language}\nExisting drugs: {existing_drugs}"
-
-    # Try up to 2 times if validation fails
     for attempt in range(2):
         try:
             response = client.chat.completions.create(
-                model="gpt-4o-mini",
+                model=GPT_MODEL,
                 messages=[
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_content}
+                    {"role": "user", "content": user_prompt}
                 ],
-                temperature=0.3,
+                temperature=GPT_TEMP,
                 response_format={"type": "json_object"}
             )
-            result = json.loads(response.choices[0].message.content)
+            data = json.loads(response.choices[0].message.content)
             
-            # Validation
-            sections = result.get("sections")
-            if not sections or not isinstance(sections, list) or len(sections) < 5:
-                print(f"⚠️ Attempt {attempt+1} failed validation: sections too short or missing")
-                continue
-
-            # Auto-save to DB logic (We save the generic entry)
-            # Find the index of sections if we want to store it in the old flat format, 
-            # but user wants the new format to be consistent. 
-            # I will store it semi-compatibly.
-            new_med = {
-                "generic": result.get("drug", drug_name).capitalize(),
-                "brands": result.get("brands", []),
-                "indication": sections[0]["content"],
-                "how_to_take": sections[1]["content"],
-                "warnings": sections[2]["content"],
-                "side_effects": sections[3]["content"],
-                "seek_help": sections[4]["content"] if len(sections) > 4 else "Seek help if symptoms worsen.",
-                "general_advice": sections[5]["content"] if len(sections) > 5 else "Store safely.",
-            }
-            
-            MEDICINE_DB.append(new_med)
-            base_dir = os.path.dirname(os.path.abspath(__file__))
-            full_path = os.path.join(base_dir, MED_DB_PATH)
-            with open(full_path, "w", encoding="utf-8") as f:
-                json.dump(MEDICINE_DB, f, indent=2, ensure_ascii=False)
-            print(f"💾 Auto-saved {drug_name} to medicines.json")
-            
-            return result
+            # Simple validation of structure
+            if "sections" in data and len(data["sections"]) >= 4:
+                # Store in DB for future use
+                new_entry = {
+                    "generic": data.get("drug", drug_name).capitalize(),
+                    "brands": data.get("brands", []),
+                    "indication": data["sections"][0]["content"],
+                    "how_to_take": data["sections"][1].get("content", ""),
+                    "warnings": data["sections"][2].get("content", ""),
+                    "side_effects": data["sections"][3].get("content", ""),
+                    "seek_help": data["sections"][4].get("content", "") if len(data["sections"]) > 4 else "",
+                    "general_advice": data["sections"][5].get("content", "") if len(data["sections"]) > 5 else ""
+                }
+                save_to_db(new_entry)
+                return data
+                
         except Exception as e:
-            print(f"❌ Attempt {attempt+1} Error: {e}")
-            if attempt == 1:
-                raise e
+            logger.error(f"AI Attempt {attempt+1} failed: {e}")
+            if attempt == 1: return None
+            
+    return None
 
-    raise Exception("Failed to generate valid AI counseling after 2 attempts")
-
-def build_structured_counseling(med, lang):
-    # If the med object already has 'sections' (from GPT), return them
-    if "sections" in med:
-        return med["sections"]
-
-    # Otherwise build from DB object
-    sections = [
-        {"header": "WHAT IS THIS MEDICINE FOR", "content": med.get("indication", "N/A")},
-        {"header": "HOW TO TAKE", "content": med.get("how_to_take") or med.get("dosage", "Use as directed.")},
-        {"header": "IMPORTANT WARNINGS", "content": med.get("warnings", "Consult physician.")},
-        {"header": "COMMON SIDE EFFECTS", "content": med.get("side_effects", "N/A")},
-        {"header": "WHEN TO SEEK MEDICAL HELP", "content": med.get("seek_help", "Seek immediate medical attention if you experience severe allergic reactions, difficulty breathing, or swelling of the face, lips, or tongue.")},
-        {"header": "GENERAL ADVICE", "content": med.get("general_advice", "Keep away from children.")}
-    ]
-    
-    if not lang or lang.lower() == "english":
-        return sections
-        
+def save_to_db(entry):
+    """Appends a new medicine to the JSON database safely."""
+    global MEDICINE_DB
     try:
-        instruction = f"Translate the following medical content to {lang}. Keep the exact headers. Return JSON object with 'sections' key (list of headers and content)."
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You are a professional medical translator. Output JSON object with 'sections' list."},
-                {"role": "user", "content": f"{instruction}\n\n{json.dumps(sections)}"}
-            ],
-            response_format={"type": "json_object"}
-        )
-        data = json.loads(response.choices[0].message.content)
-        if isinstance(data, list): return data
-        if "sections" in data: return data["sections"]
-        return sections
+        # Check if already exists to avoid duplicates
+        norm_new = normalize(entry["generic"])
+        if any(normalize(m.get("generic")) == norm_new for m in MEDICINE_DB):
+            return
+
+        MEDICINE_DB.append(entry)
+        os.makedirs(os.path.dirname(MED_DB_PATH), exist_ok=True)
+        with open(MED_DB_PATH, "w", encoding="utf-8") as f:
+            json.dump(MEDICINE_DB, f, indent=2, ensure_ascii=False)
+        logger.info(f"Saved new medicine to DB: {entry['generic']}")
     except Exception as e:
-        print(f"❌ Translation error: {e}")
-        return sections
+        logger.error(f"Failed to save to DB: {e}")
 
-# Voice system temporarily disabled
+# ---------------- API ROUTES ----------------
 
-# ---------------- ROUTES ----------------
+@app.route("/", methods=["GET"])
+def index():
+    return jsonify({"service": "RxKounsel Production API", "version": "2.0.0"}), 200
 
-# Audio serving disabled
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({
+        "status": "ok",
+        "db_size": len(MEDICINE_DB),
+        "uptime_checkpoint": "active"
+    }), 200
 
 @app.route("/api/counseling", methods=["POST"])
 def counseling():
+    """Unified endpoint for Counseling + Interaction Detection."""
     try:
-        data = request.get_json(force=True)
-        drug = data.get("drug", "").strip()
-        lang = data.get("lang", "English").strip()
-        existing_drugs = data.get("existing_drugs", [])
-
-        print(f"📥 Received request for {drug} in {lang}")
+        payload = request.get_json(force=True)
+        drug = payload.get("drug", "").strip()
+        lang = payload.get("lang", "English").strip()
+        cabinet = payload.get("existing_drugs", []) # Cabinet = currently taken drugs
 
         if not drug:
-            return jsonify({
-                "found": False, 
-                "error": "No drug name provided."
-            }), 200
+            return jsonify({"error": "Drug name is required"}), 400
 
-        med = find_medicine(drug)
-        if med:
-            print("Medicine found in DB")
-            sections = build_structured_counseling(med, lang)
-        else:
-            # Force AI generation if not in DB
-            ai_data = generate_with_gpt(drug, lang, existing_drugs)
-            print("Medicine generated via RxKounsel AI")
-            sections = ai_data["sections"]
-            # Update 'med' for interaction check below
-            med = {"generic": ai_data.get("drug", drug)}
+        logger.info(f"Request: Drug={drug}, Lang={lang}, CabinetSize={len(cabinet)}")
 
-        interaction_metadata = check_interactions(
-            med.get("generic") or med.get("name") or drug,
-            existing_drugs
-        )
-        print("Interaction computed")
+        # 1. SEARCH LOCAL DB FIRST
+        med_data = None
+        db_match = None
+        
+        norm_target = normalize(drug)
+        for m in MEDICINE_DB:
+            if normalize(m.get("generic")) == norm_target or any(normalize(b) == norm_target for b in m.get("brands", [])):
+                db_match = m
+                break
+        
+        if db_match:
+            logger.info(f"Database Hit: {drug}")
+            # Build sections from DB format
+            sections = [
+                {"header": "WHAT IS THIS MEDICINE FOR", "content": db_match.get("indication", "N/A")},
+                {"header": "HOW TO TAKE", "content": db_match.get("how_to_take", "N/A")},
+                {"header": "IMPORTANT WARNINGS", "content": db_match.get("warnings", "N/A")},
+                {"header": "COMMON SIDE EFFECTS", "content": db_match.get("side_effects", "N/A")},
+                {"header": "WHEN TO SEEK MEDICAL HELP", "content": db_match.get("seek_help", "N/A")},
+                {"header": "GENERAL ADVICE", "content": db_match.get("general_advice", "N/A")}
+            ]
+            med_data = {"drug": db_match.get("generic"), "sections": sections}
+        
+        # 2. AI FALLBACK IF NOT FOUND
+        if not med_data:
+            logger.info(f"Database Miss. Triggering AI Fallback for {drug}...")
+            med_data = generate_ai_counseling(drug, lang, cabinet)
 
-        # Voice system disabled
-        # audio_url = generate_tts_file(sections, drug, lang)
+        if not med_data:
+            return jsonify({"error": "Counseling could not be generated at this time."}), 503
 
+        # 3. INTERACTION ENGINE
+        interaction_report = check_drug_interactions(drug, cabinet)
+
+        # 4. UNIFIED RESPONSE
         return jsonify({
-            "found": True,
-            "sections": sections,
-            "interaction_metadata": interaction_metadata
+            "status": "success",
+            "medicine": med_data.get("drug"),
+            "sections": med_data.get("sections"),
+            "interaction_report": interaction_report,
+            "metadata": {
+                "language": lang,
+                "source": "database" if db_match else "ai_generation"
+            }
         }), 200
 
     except Exception as e:
-        print(f"❌ COUNSELING ERROR: {e}")
-        return jsonify({
-            "found": False, 
-            "error": "AI counseling generation failed. Please try again."
-        }), 200
+        logger.error(f"Endpoint Error: {e}")
+        return jsonify({"error": "Internal Server Error"}), 500
 
-@app.route("/")
-def home():
-    return {"status": "ok"}
-
-@app.route("/health")
-def health():
-    return {"status": "ok", "db_size": len(MEDICINE_DB)}
-
+# ---------------- SERVER ----------------
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5050))
+    # Development Server
+    port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
